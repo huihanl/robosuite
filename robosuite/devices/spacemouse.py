@@ -90,8 +90,214 @@ def convert(b1, b2):
     """
     return scale_to_control(to_int16(b1, b2))
 
+class SpaceMouse():
+    """
+    A minimalistic driver class for SpaceMouse with HID library.
 
-class SpaceMouse(Device):
+    Note: Use hid.enumerate() to view all USB human interface devices (HID).
+    Make sure SpaceMouse is detected before running the script.
+    You can look up its vendor/product id from this method.
+
+    Args:
+        vendor_id (int): HID device vendor id
+        product_id (int): HID device product id
+        pos_sensitivity (float): Magnitude of input position command scaling
+        rot_sensitivity (float): Magnitude of scale input rotation commands scaling
+    """
+
+    def __init__(self,
+                 vendor_id=9583,
+                 product_id=50741,
+                 pos_sensitivity=1.0,
+                 rot_sensitivity=1.0
+                 ):
+
+        print("Opening SpaceMouse device")
+        self.device = hid.device()
+        self.device.open(vendor_id, product_id)  # SpaceMouse
+
+        self.pos_sensitivity = pos_sensitivity
+        self.rot_sensitivity = rot_sensitivity
+
+        print("Manufacturer: %s" % self.device.get_manufacturer_string())
+        print("Product: %s" % self.device.get_product_string())
+
+        # 6-DOF variables
+        self.x, self.y, self.z = 0, 0, 0
+        self.roll, self.pitch, self.yaw = 0, 0, 0
+
+        self._display_controls()
+
+        self.single_click_and_hold = False
+
+        self._control = [0., 0., 0., 0., 0., 0.]
+        self._reset_state = 0
+        self.rotation = np.array([[-1., 0., 0.], [0., 1., 0.], [0., 0., -1.]])
+        self._enabled = False
+
+        # launch a new listener thread to listen to SpaceMouse
+        self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
+        self.thread.start()
+
+    @staticmethod
+    def _display_controls():
+        """
+        Method to pretty print controls.
+        """
+
+        def print_command(char, info):
+            char += " " * (30 - len(char))
+            print("{}\t{}".format(char, info))
+
+        print("")
+        print_command("Control", "Command")
+        print_command("Right button", "reset simulation")
+        print_command("Left button (hold)", "close gripper")
+        print_command("Move mouse laterally", "move arm horizontally in x-y plane")
+        print_command("Move mouse vertically", "move arm vertically")
+        print_command(
+            "Twist mouse about an axis", "rotate arm about a corresponding axis"
+        )
+        print_command("ESC", "quit")
+        print("")
+
+    def _reset_internal_state(self):
+        """
+        Resets internal state of controller, except for the reset signal.
+        """
+        self.rotation = np.array([[-1., 0., 0.], [0., 1., 0.], [0., 0., -1.]])
+        # Reset 6-DOF variables
+        self.x, self.y, self.z = 0, 0, 0
+        self.roll, self.pitch, self.yaw = 0, 0, 0
+        # Reset control
+        self._control = np.zeros(6)
+        # Reset grasp
+        self.single_click_and_hold = False
+
+    def start_control(self):
+        """
+        Method that should be called externally before controller can
+        start receiving commands.
+        """
+        self._reset_internal_state()
+        self._reset_state = 0
+        self._enabled = True
+
+    def get_controller_state(self):
+        """
+        Grabs the current state of the 3D mouse.
+
+        Returns:
+            dict: A dictionary containing dpos, orn, unmodified orn, grasp, and reset
+        """
+        dpos = self.control[:3] * 0.005 * self.pos_sensitivity
+        roll, pitch, yaw = self.control[3:] * 0.005 * self.rot_sensitivity
+
+        # convert RPY to an absolute orientation
+        drot1 = rotation_matrix(angle=-pitch, direction=[1., 0, 0], point=None)[:3, :3]
+        drot2 = rotation_matrix(angle=roll, direction=[0, 1., 0], point=None)[:3, :3]
+        drot3 = rotation_matrix(angle=yaw, direction=[0, 0, 1.], point=None)[:3, :3]
+
+        self.rotation = self.rotation.dot(drot1.dot(drot2.dot(drot3)))
+
+        return dict(
+            dpos=dpos,
+            rotation=self.rotation,
+            raw_drotation=np.array([roll, pitch, yaw]),
+            grasp=self.control_gripper,
+            reset=self._reset_state
+        )
+
+    def run(self):
+        """Listener method that keeps pulling new messages."""
+
+        t_last_click = -1
+
+        while True:
+            d = self.device.read(13)
+            if d is not None and self._enabled:
+
+                if d[0] == 1:  ## readings from 6-DoF sensor
+                    self.y = convert(d[1], d[2])
+                    self.x = convert(d[3], d[4])
+                    self.z = convert(d[5], d[6]) * -1.0
+
+                    # self.roll = convert(d[7], d[8])
+                    # self.pitch = convert(d[9], d[10])
+                    # self.yaw = convert(d[11], d[12])
+
+                    # self._control = [
+                    #     self.x,
+                    #     self.y,
+                    #     self.z,
+                    #     self.roll,
+                    #     self.pitch,
+                    #     self.yaw,
+                    # ]
+
+                elif d[0] == 2:  ## readings from 6-DoF sensor
+                    self.roll = convert(d[1], d[2])
+                    self.pitch = convert(d[3], d[4])
+                    self.yaw = convert(d[5], d[6])
+
+                    # self.roll = convert(d[7], d[8])
+                    # self.pitch = convert(d[9], d[10])
+                    # self.yaw = convert(d[11], d[12])
+
+                    self._control = [
+                        self.x,
+                        self.y,
+                        self.z,
+                        self.roll,
+                        self.pitch,
+                        self.yaw,
+                    ]
+
+                elif d[0] == 3:  ## readings from the side buttons
+
+                    # press left button
+                    if d[1] == 1:
+                        t_click = time.time()
+                        elapsed_time = t_click - t_last_click
+                        t_last_click = t_click
+                        self.single_click_and_hold = True
+
+                    # release left button
+                    if d[1] == 0:
+                        self.single_click_and_hold = False
+
+                    # right button is for reset
+                    if d[1] == 2:
+                        self._reset_state = 1
+                        continue
+                        # self._reset_state = 1
+                        # self._enabled = False
+                        # self._reset_internal_state()
+
+    @property
+    def control(self):
+        """
+        Grabs current pose of Spacemouse
+
+        Returns:
+            np.array: 6-DoF control value
+        """
+        return np.array(self._control)
+
+    @property
+    def control_gripper(self):
+        """
+        Maps internal states into gripper commands.
+
+        Returns:
+            float: Whether we're using single click and hold or not
+        """
+        if self.single_click_and_hold:
+            return 1.0
+        return 0
+
+class SpaceMouseRobosuite(Device):
     """
     A minimalistic driver class for SpaceMouse with HID library.
 
