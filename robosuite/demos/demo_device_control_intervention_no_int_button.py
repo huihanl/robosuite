@@ -100,13 +100,15 @@ import numpy as np
 import robosuite as suite
 from robosuite import load_controller_config
 from robosuite.utils.input_utils import input2action
-from robosuite.wrappers import VisualizationWrapper
+from robosuite.wrappers import VisualizationWrapper, DataCollectionWrapper
 from tqdm import tqdm
 import time
 import numpy as np
 from datetime import datetime
 import torch
 import csv
+EPISODE_LENGTH = 200 - 1
+SUCCESS_HOLD = 5
 
 class RandomPolicy():
     def __init__(self, env):
@@ -147,6 +149,13 @@ def write_to_csv(csv_path, data):
 def write_header(csv_path, header):
     write_to_csv(csv_path, header)
 
+def terminate_condition_met(time_success, timestep_count, term_cond):
+    assert term_cond in ["fixed_length", "success_count"]
+    if term_cond == "fixed_length":
+        return timestep_count == EPISODE_LENGTH and time_success > 0
+    elif term_cond == "success_count":
+        return time_success == SUCCESS_HOLD
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -166,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--csv-filename", type=str, default="")
     parser.add_argument("--all-demos", default=False, type=bool)
+    parser.add_argument("--term-condition", default="fixed_length", type=str)
     args = parser.parse_args()
 
     # Import controller config for EE IK or OSC (pos/ori)
@@ -210,6 +220,8 @@ if __name__ == "__main__":
         hard_reset=False,
     )
 
+    env = DataCollectionWrapper(env, "/home/huihanl")
+
     if args.checkpoint == "":
         policy = RandomPolicy(env)
     else:
@@ -246,6 +258,8 @@ if __name__ == "__main__":
 
     agent_success = 0
 
+    success_at_time_lst = []
+
     for traj_id in tqdm(range(args.num_trajectories)):
 
         if len(data) % 5 == 0:
@@ -259,6 +273,7 @@ if __name__ == "__main__":
             observations=[],
             actions=[],
             rewards=[],
+            dense_rewards=[],
             next_observations=[],
             terminals=[],
             is_human=[],
@@ -287,7 +302,10 @@ if __name__ == "__main__":
 
         this_human_sample = 0
 
+        first_nonzero = False
+
         while True:
+            #time.sleep(0.1)
 
             # Set active robot
             active_robot = env.robots[0] if args.config == "bimanual" else env.robots[args.arm == "left"]
@@ -340,13 +358,17 @@ if __name__ == "__main__":
 
             if is_empty_input_spacemouse(action):
                 if args.all_demos:
-                    continue # if all demos, no action
+                    if not first_nonzero: # if have not seen nonzero action, should not be zero action
+                        continue # if all demos, no action
+                    # else: okay to be zero action afterwards
+                    this_human_sample += 1
                 else:
                     action = policy.get_action(obs["state"]) # if not all demos, use agent action
                 #print(action)
                 #continue
                 is_human = 0
             else:
+                first_nonzero = True
                 this_human_sample += 1
                 if args.all_demos:
                     is_human = 0 # iter 0 is viewed as non-intervention
@@ -354,13 +376,15 @@ if __name__ == "__main__":
                     is_human = 1
             #action += np.random.normal(0, 0.05, 7)
             # Step through the simulation and render
+            print(action)
             next_obs, reward, done, info = env.step(action)
 
             next_obs = post_process_state(next_obs)
 
             traj["observations"].append(obs)
             traj["actions"].append(action)
-            traj["rewards"].append(reward)
+            traj["rewards"].append(0.0 if reward < 1.0 else 1.0)
+            traj["dense_rewards"].append(reward)
             traj["next_observations"].append(next_obs)
             traj["terminals"].append(done)
             traj["is_human"].append(is_human)
@@ -374,8 +398,13 @@ if __name__ == "__main__":
 
             if env._check_success():
                 time_success += 1
+                if time_success == 1:
+                    success_at_time_lst.append(timestep_count)
+                    print("Success length: ", timestep_count)
 
-            if time_success == 5:
+            if terminate_condition_met(time_success=time_success,
+                                       timestep_count=timestep_count,
+                                       term_cond=args.term_condition):
                 data.append(traj)
                 print("trajectory length: ", len(traj["actions"]))
                 total_human_samples += this_human_sample
@@ -385,7 +414,7 @@ if __name__ == "__main__":
                     print("AGENT SUCCESS: ", this_human_sample == 0)
                 break
             timestep_count += 1
-            if timestep_count > 1600:
+            if timestep_count > 401:
                 print("discard this trial")
                 break
 
