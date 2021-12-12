@@ -23,6 +23,6 @@ for traj in data:
                                           next_o["object-state"]])
         traj["next_observations"][t] = {"state": next_state_info}
         
-        new_data.append(traj)
+    new_data.append(traj)
 
 np.save("{}_cleaned".format(data_path[:-4]), new_data)
