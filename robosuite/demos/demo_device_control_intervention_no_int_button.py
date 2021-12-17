@@ -96,7 +96,7 @@ Examples:
 
 import argparse
 import numpy as np
-
+import os
 import robosuite as suite
 from robosuite import load_controller_config
 from robosuite.utils.input_utils import input2action
@@ -107,7 +107,7 @@ import numpy as np
 from datetime import datetime
 import torch
 import csv
-EPISODE_LENGTH = 200 - 1
+EPISODE_LENGTH = 250 - 1
 SUCCESS_HOLD = 5
 
 class RandomPolicy():
@@ -156,6 +156,244 @@ def terminate_condition_met(time_success, timestep_count, term_cond):
     elif term_cond == "success_count":
         return time_success == SUCCESS_HOLD
 
+def gather_demonstrations_as_hdf5(directory, out_dir, env_info, remove_directory=[]):
+    """
+    Gathers the demonstrations saved in @directory into a
+    single hdf5 file.
+
+    The strucure of the hdf5 file is as follows.
+
+    data (group)
+        date (attribute) - date of collection
+        time (attribute) - time of collection
+        repository_version (attribute) - repository version used during collection
+        env (attribute) - environment name on which demos were collected
+
+        demo1 (group) - every demonstration has a group
+            model_file (attribute) - model xml string for demonstration
+            states (dataset) - flattened mujoco states
+            actions (dataset) - actions applied during demonstration
+
+        demo2 (group)
+        ...
+
+    Args:
+        directory (str): Path to the directory containing raw demonstrations.
+        out_dir (str): Path to where to store the hdf5 file.
+        env_info (str): JSON-encoded string containing environment information,
+            including controller and robot info
+    """
+
+    hdf5_path = os.path.join(out_dir, "demo.hdf5")
+    f = h5py.File(hdf5_path, "w")
+
+    # store some metadata in the attributes of one group
+    grp = f.create_group("data")
+
+    num_eps = 0
+    env_name = None  # will get populated at some point
+
+    for ep_directory in os.listdir(directory):
+        print(ep_directory)
+        if ep_directory in remove_directory:
+            print("Skipping")
+            continue
+        state_paths = os.path.join(directory, ep_directory, "state_*.npz")
+        states = []
+        actions = []
+
+        for state_file in sorted(glob(state_paths)):
+            dic = np.load(state_file, allow_pickle=True)
+            env_name = str(dic["env"])
+
+            states.extend(dic["states"])
+            for ai in dic["action_infos"]:
+                actions.append(ai["actions"])
+
+        if len(states) == 0:
+            continue
+
+        # Delete the first actions and the last state. This is because when the DataCollector wrapper
+        # recorded the states and actions, the states were recorded AFTER playing that action.
+        del states[-1]
+        assert len(states) == len(actions)
+
+        num_eps += 1
+        ep_data_grp = grp.create_group("demo_{}".format(num_eps))
+
+        # store model xml as an attribute
+        xml_path = os.path.join(directory, ep_directory, "model.xml")
+        with open(xml_path, "r") as f:
+            xml_str = f.read()
+        ep_data_grp.attrs["model_file"] = xml_str
+
+        # write datasets for states and actions
+        ep_data_grp.create_dataset("states", data=np.array(states))
+        ep_data_grp.create_dataset("actions", data=np.array(actions))
+
+    # write dataset attributes (metadata)
+    now = datetime.datetime.now()
+    grp.attrs["date"] = "{}-{}-{}".format(now.month, now.day, now.year)
+    grp.attrs["time"] = "{}:{}:{}".format(now.hour, now.minute, now.second)
+    grp.attrs["repository_version"] = suite.__version__
+    grp.attrs["env"] = env_name
+    grp.attrs["env_info"] = env_info
+
+    f.close()
+
+def collect_trajectory(env, device, args, data, remove_directory):
+
+    if len(data) % 5 == 0:
+
+        save_name = "/home/huihanl/{}-iter_{}-n_{}_{}.npy".format(args.environment,
+                                                                  args.training_iter,
+                                                                  len(data), datetime.now().strftime("%m_%d_%H_%M_%S"))
+        np.save(save_name, data)
+
+    traj = dict(
+        observations=[],
+        actions=[],
+        rewards=[],
+        dense_rewards=[],
+        next_observations=[],
+        terminals=[],
+        is_human=[],
+    )
+
+    # Reset the environment
+    obs = env.reset()
+    obs = post_process_state(obs)
+
+    #time.sleep(2)
+
+    # Setup rendering
+    cam_id = 0
+    num_cam = len(env.sim.model.camera_names)
+    env.render()
+
+    # Initialize variables that should the maintained between resets
+    last_grasp = 0
+
+    # Initialize device control
+    device.start_control()
+
+    time_success = 0
+
+    timestep_count = 0
+
+    this_human_sample = 0
+
+    first_nonzero = False
+
+    saving = True
+
+    success_at_time = -1
+
+    while True:
+
+        # Set active robot
+        active_robot = env.robots[0] if args.config == "bimanual" else env.robots[args.arm == "left"]
+
+        # Get the newest action
+        action, grasp = input2action(
+            device=device,
+            robot=active_robot,
+            active_arm=args.arm,
+            env_configuration=args.config
+        )
+
+        if action is None:
+            saving = False
+            break
+
+        """ Fixing Spacemouse Action """
+        # If the current grasp is active (1) and last grasp is not (-1) (i.e.: grasping input just pressed),
+        # toggle arm control and / or camera viewing angle if requested
+        if last_grasp < 0 < grasp:
+            if args.switch_on_grasp:
+                args.arm = "left" if args.arm == "right" else "right"
+            if args.toggle_camera_on_grasp:
+                cam_id = (cam_id + 1) % num_cam
+                env.viewer.set_camera(camera_id=cam_id)
+        # Update last grasp
+        last_grasp = grasp
+
+        # Fill out the rest of the action space if necessary
+        rem_action_dim = env.action_dim - action.size
+        if rem_action_dim > 0:
+            # Initialize remaining action space
+            rem_action = np.zeros(rem_action_dim)
+            # This is a multi-arm setting, choose which arm to control and fill the rest with zeros
+            if args.arm == "right":
+                action = np.concatenate([action, rem_action])
+            elif args.arm == "left":
+                action = np.concatenate([rem_action, action])
+            else:
+                # Only right and left arms supported
+                print("Error: Unsupported arm specified -- "
+                      "must be either 'right' or 'left'! Got: {}".format(args.arm))
+        elif rem_action_dim < 0:
+            # We're in an environment with no gripper action space, so trim the action space to be the action dim
+            action = action[:env.action_dim]
+
+        """ End Fixing Spacemouse Action """
+
+        if is_empty_input_spacemouse(action):
+            if args.all_demos:
+                if not first_nonzero: # if have not seen nonzero action, should not be zero action
+                    continue # if all demos, no action
+                # else: okay to be zero action afterwards
+                this_human_sample += 1
+            else:
+                action = policy.get_action(obs["state"]) # if not all demos, use agent action
+            is_human = 0
+        else:
+            first_nonzero = True
+            this_human_sample += 1
+            if args.all_demos:
+                is_human = 0 # iter 0 is viewed as non-intervention
+            else:
+                is_human = 1
+
+        # Step through the simulation and render
+        print(action)
+        next_obs, reward, done, info = env.step(action)
+
+        next_obs = post_process_state(next_obs)
+
+        traj["observations"].append(obs)
+        traj["actions"].append(action)
+        traj["rewards"].append(0.0 if reward < 1.0 else 1.0)
+        traj["dense_rewards"].append(reward)
+        traj["next_observations"].append(next_obs)
+        traj["terminals"].append(done)
+        traj["is_human"].append(is_human)
+        obs = next_obs
+
+        env.render()
+
+        if env._check_success():
+            time_success += 1
+            if time_success == 1:
+                print("Success length: ", timestep_count)
+                success_at_time = timestep_count
+
+        if terminate_condition_met(time_success=time_success,
+                                   timestep_count=timestep_count,
+                                   term_cond=args.term_condition):
+            data.append(traj)
+
+        timestep_count += 1
+        if timestep_count > EPISODE_LENGTH:
+            print("discard this trial")
+            saving = False
+            break
+
+    if not saving:
+        remove_directory.append(env.ep_directory.split('/')[-1])
+    env.close()
+    return saving, this_human_sample, success_at_time, traj
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -174,8 +412,9 @@ if __name__ == "__main__":
     parser.add_argument("--training-iter", type=int)
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--csv-filename", type=str, default="")
-    parser.add_argument("--all-demos", default=False, type=bool)
+    parser.add_argument("--all-demos", action="store_true", default=False)
     parser.add_argument("--term-condition", default="fixed_length", type=str)
+    parser.add_argument("--base-dir", default="/home/huihanl/HITL_data", type=str)
     args = parser.parse_args()
 
     # Import controller config for EE IK or OSC (pos/ori)
@@ -220,7 +459,12 @@ if __name__ == "__main__":
         hard_reset=False,
     )
 
-    env = DataCollectionWrapper(env, "/home/huihanl")
+    save_datetime = datetime.now().strftime("%m_%d_%H_%M_%S")
+    base_dir_home = "{}/demonstration_data".format(args.base_dir)
+    tmp_dir = "{}/{}_{}".format(base_dir_home,
+                                args.environment,
+                                save_datetime)
+    env = DataCollectionWrapper(env, tmp_dir)
 
     if args.checkpoint == "":
         policy = RandomPolicy(env)
@@ -249,177 +493,39 @@ if __name__ == "__main__":
             "Invalid device choice: choose either 'keyboard' or 'spacemouse'."
         )
 
+    save_dir = os.path.join(args.base_dir, "{}_iter_{}".format(save_datetime, args.training_iter))
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
     data = []
+
+    data_fail = []
 
     start = time.perf_counter()
 
     total_human_samples = 0
     total_samples = 0
-
     agent_success = 0
-
     success_at_time_lst = []
 
+    remove_directory = []
+
+    env_info = json.dumps(config)
+
     for traj_id in tqdm(range(args.num_trajectories)):
-
-        if len(data) % 5 == 0:
-
-            save_name = "/home/huihanl/{}-iter_{}-n_{}_{}.npy".format(args.environment,
-                                                        args.training_iter,
-                                                        len(data), datetime.now().strftime("%m_%d_%H_%M_%S"))
-            np.save(save_name, data)
-
-        traj = dict(
-            observations=[],
-            actions=[],
-            rewards=[],
-            dense_rewards=[],
-            next_observations=[],
-            terminals=[],
-            is_human=[],
-        )
-
-        # Reset the environment
-        obs = env.reset()
-        obs = post_process_state(obs)
-
-        #time.sleep(2)
-
-        # Setup rendering
-        cam_id = 0
-        num_cam = len(env.sim.model.camera_names)
-        env.render()
-
-        # Initialize variables that should the maintained between resets
-        last_grasp = 0
-
-        # Initialize device control
-        device.start_control()
-
-        time_success = 0
-
-        timestep_count = 0
-
-        this_human_sample = 0
-
-        first_nonzero = False
-
-        while True:
-            #time.sleep(0.1)
-
-            # Set active robot
-            active_robot = env.robots[0] if args.config == "bimanual" else env.robots[args.arm == "left"]
-
-            # Get the newest action
-            action, grasp = input2action(
-                device=device,
-                robot=active_robot,
-                active_arm=args.arm,
-                env_configuration=args.config
-            )
-            #print(action)
-            if action is None:
-                break
-
-            """ Fixing Spacemouse Action """
-            # If the current grasp is active (1) and last grasp is not (-1) (i.e.: grasping input just pressed),
-            # toggle arm control and / or camera viewing angle if requested
-            if last_grasp < 0 < grasp:
-                if args.switch_on_grasp:
-                    args.arm = "left" if args.arm == "right" else "right"
-                if args.toggle_camera_on_grasp:
-                    cam_id = (cam_id + 1) % num_cam
-                    env.viewer.set_camera(camera_id=cam_id)
-            # Update last grasp
-            last_grasp = grasp
-
-            # Fill out the rest of the action space if necessary
-            rem_action_dim = env.action_dim - action.size
-            if rem_action_dim > 0:
-                # Initialize remaining action space
-                rem_action = np.zeros(rem_action_dim)
-                # This is a multi-arm setting, choose which arm to control and fill the rest with zeros
-                if args.arm == "right":
-                    action = np.concatenate([action, rem_action])
-                elif args.arm == "left":
-                    action = np.concatenate([rem_action, action])
-                else:
-                    # Only right and left arms supported
-                    print("Error: Unsupported arm specified -- "
-                          "must be either 'right' or 'left'! Got: {}".format(args.arm))
-            elif rem_action_dim < 0:
-                # We're in an environment with no gripper action space, so trim the action space to be the action dim
-                action = action[:env.action_dim]
-
-            """ End Fixing Spacemouse Action """
-
-            #if human_take_control and is_empty_input_spacemouse(action):
-            #    continue
-
-            if is_empty_input_spacemouse(action):
-                if args.all_demos:
-                    if not first_nonzero: # if have not seen nonzero action, should not be zero action
-                        continue # if all demos, no action
-                    # else: okay to be zero action afterwards
-                    this_human_sample += 1
-                else:
-                    action = policy.get_action(obs["state"]) # if not all demos, use agent action
-                #print(action)
-                #continue
-                is_human = 0
-            else:
-                first_nonzero = True
-                this_human_sample += 1
-                if args.all_demos:
-                    is_human = 0 # iter 0 is viewed as non-intervention
-                else:
-                    is_human = 1
-            #action += np.random.normal(0, 0.05, 7)
-            # Step through the simulation and render
-            print(action)
-            next_obs, reward, done, info = env.step(action)
-
-            next_obs = post_process_state(next_obs)
-
-            traj["observations"].append(obs)
-            traj["actions"].append(action)
-            traj["rewards"].append(0.0 if reward < 1.0 else 1.0)
-            traj["dense_rewards"].append(reward)
-            traj["next_observations"].append(next_obs)
-            traj["terminals"].append(done)
-            traj["is_human"].append(is_human)
-            obs = next_obs
-            # print("state obs: ")
-            # print(traj["observations"])
-            # print("action: ")
-            # print(traj["actions"])
-
-            env.render()
-
-            if env._check_success():
-                time_success += 1
-                if time_success == 1:
-                    success_at_time_lst.append(timestep_count)
-                    print("Success length: ", timestep_count)
-
-            if terminate_condition_met(time_success=time_success,
-                                       timestep_count=timestep_count,
-                                       term_cond=args.term_condition):
-                data.append(traj)
-                print("trajectory length: ", len(traj["actions"]))
-                total_human_samples += this_human_sample
-                total_samples += len(traj["actions"])
-                if this_human_sample == 0:
-                    agent_success += 1
-                    print("AGENT SUCCESS: ", this_human_sample == 0)
-                break
-            timestep_count += 1
-            if timestep_count > 401:
-                print("discard this trial")
-                break
+        saving, this_human_sample, success_at_time, traj = collect_trajectory(env, device, args, data, remove_directory)
+        if saving:
+            total_human_samples += this_human_sample
+            total_samples += len(traj["actions"])
+            if this_human_sample == 0:
+                agent_success += 1
+                # print("AGENT SUCCESS: ", this_human_sample == 0)
+            success_at_time_lst.append(success_at_time)
+            gather_demonstrations_as_hdf5(tmp_dir, tmp_dir, env_info, remove_directory)
 
     end = time.perf_counter()
 
+    """ Record Experiment Iteration Info """
     total_time = end - start
     num_success = len(data)
     success_rate = len(data) / args.num_trajectories
@@ -441,12 +547,6 @@ if __name__ == "__main__":
     print("human sample per traj: ", human_sample_per_traj)
     print("aver time per traj: ", aver_time_per_traj)
     print("aver traj length: ", aver_traj_length)
-
-    save_name = "/home/huihanl/{}-iter_{}-n_{}-{}_final.npy".format(args.environment,
-                                                              args.training_iter,
-                                                              len(data),
-                                                              datetime.now().strftime("%m_%d_%H_%M_%S")
-                                                              )
 
     experiment_info = [
         args.training_iter,
@@ -486,4 +586,16 @@ if __name__ == "__main__":
         write_header(args.csv_filename, header)
     write_to_csv(args.csv_filename, experiment_info)
 
-    np.save(save_name, data)
+    """ Save data into numpy array """
+    save_name = "{}-iter_{}-n_{}_final.npy".format(args.environment,
+                                                   args.training_iter,
+                                                   len(data),
+                                                   )
+
+    save_name_failed = "{}-iter_{}-n_{}_final_failed.npy".format(args.environment,
+                                                                 args.training_iter,
+                                                                 len(data_fail),
+                                                                 )
+
+    np.save(os.path.join(save_dir, save_name), data)
+    np.save(os.path.join(save_dir, save_name_failed), data_fail)
