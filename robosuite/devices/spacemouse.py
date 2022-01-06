@@ -107,7 +107,7 @@ class SpaceMouse():
 
     def __init__(self,
                  vendor_id=9583,
-                 product_id=50741,
+                 product_id=50734,
                  pos_sensitivity=1.0,
                  rot_sensitivity=1.0
                  ):
@@ -223,27 +223,9 @@ class SpaceMouse():
                     self.x = convert(d[3], d[4])
                     self.z = convert(d[5], d[6]) * -1.0
 
-                    # self.roll = convert(d[7], d[8])
-                    # self.pitch = convert(d[9], d[10])
-                    # self.yaw = convert(d[11], d[12])
-
-                    # self._control = [
-                    #     self.x,
-                    #     self.y,
-                    #     self.z,
-                    #     self.roll,
-                    #     self.pitch,
-                    #     self.yaw,
-                    # ]
-
-                elif d[0] == 2:  ## readings from 6-DoF sensor
-                    self.roll = convert(d[1], d[2])
-                    self.pitch = convert(d[3], d[4])
-                    self.yaw = convert(d[5], d[6])
-
-                    # self.roll = convert(d[7], d[8])
-                    # self.pitch = convert(d[9], d[10])
-                    # self.yaw = convert(d[11], d[12])
+                    self.roll = convert(d[7], d[8])
+                    self.pitch = convert(d[9], d[10])
+                    self.yaw = convert(d[11], d[12])
 
                     self._control = [
                         self.x,

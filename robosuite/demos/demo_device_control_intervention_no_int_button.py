@@ -1,98 +1,4 @@
-"""Teleoperate robot with keyboard or SpaceMouse.
-
-***Choose user input option with the --device argument***
-
-Keyboard:
-    We use the keyboard to control the end-effector of the robot.
-    The keyboard provides 6-DoF control commands through various keys.
-    The commands are mapped to joint velocities through an inverse kinematics
-    solver from Bullet physics.
-
-    Note:
-        To run this script with Mac OS X, you must run it with root access.
-
-SpaceMouse:
-
-    We use the SpaceMouse 3D mouse to control the end-effector of the robot.
-    The mouse provides 6-DoF control commands. The commands are mapped to joint
-    velocities through an inverse kinematics solver from Bullet physics.
-
-    The two side buttons of SpaceMouse are used for controlling the grippers.
-
-    SpaceMouse Wireless from 3Dconnexion: https://www.3dconnexion.com/spacemouse_wireless/en/
-    We used the SpaceMouse Wireless in our experiments. The paper below used the same device
-    to collect human demonstrations for imitation learning.
-
-    Reinforcement and Imitation Learning for Diverse Visuomotor Skills
-    Yuke Zhu, Ziyu Wang, Josh Merel, Andrei Rusu, Tom Erez, Serkan Cabi, Saran Tunyasuvunakool,
-    János Kramár, Raia Hadsell, Nando de Freitas, Nicolas Heess
-    RSS 2018
-
-    Note:
-        This current implementation only supports Mac OS X (Linux support can be added).
-        Download and install the driver before running the script:
-            https://www.3dconnexion.com/service/drivers.html
-
-Additionally, --pos_sensitivity and --rot_sensitivity provide relative gains for increasing / decreasing the user input
-device sensitivity
-
-
-***Choose controller with the --controller argument***
-
-Choice of using either inverse kinematics controller (ik) or operational space controller (osc):
-Main difference is that user inputs with ik's rotations are always taken relative to eef coordinate frame, whereas
-    user inputs with osc's rotations are taken relative to global frame (i.e.: static / camera frame of reference).
-
-    Notes:
-        OSC also tends to be more computationally efficient since IK relies on the backend pybullet IK solver.
-
-
-***Choose environment specifics with the following arguments***
-
-    --environment: Task to perform, e.g.: "Lift", "TwoArmPegInHole", "NutAssembly", etc.
-
-    --robots: Robot(s) with which to perform the task. Can be any in
-        {"Panda", "Sawyer", "IIWA", "Jaco", "Kinova3", "UR5e", "Baxter"}. Note that the environments include sanity
-        checks, such that a "TwoArm..." environment will only accept either a 2-tuple of robot names or a single
-        bimanual robot name, according to the specified configuration (see below), and all other environments will
-        only accept a single single-armed robot name
-
-    --config: Exclusively applicable and only should be specified for "TwoArm..." environments. Specifies the robot
-        configuration desired for the task. Options are {"bimanual", "single-arm-parallel", and "single-arm-opposed"}
-
-            -"bimanual": Sets up the environment for a single bimanual robot. Expects a single bimanual robot name to
-                be specified in the --robots argument
-
-            -"single-arm-parallel": Sets up the environment such that two single-armed robots are stationed next to
-                each other facing the same direction. Expects a 2-tuple of single-armed robot names to be specified
-                in the --robots argument.
-
-            -"single-arm-opposed": Sets up the environment such that two single-armed robots are stationed opposed from
-                each other, facing each other from opposite directions. Expects a 2-tuple of single-armed robot names
-                to be specified in the --robots argument.
-
-    --arm: Exclusively applicable and only should be specified for "TwoArm..." environments. Specifies which of the
-        multiple arm eef's to control. The other (passive) arm will remain stationary. Options are {"right", "left"}
-        (from the point of view of the robot(s) facing against the viewer direction)
-
-    --switch-on-grasp: Exclusively applicable and only should be specified for "TwoArm..." environments. If enabled,
-        will switch the current arm being controlled every time the gripper input is pressed
-
-    --toggle-camera-on-grasp: If enabled, gripper input presses will cycle through the available camera angles
-
-Examples:
-
-    For normal single-arm environment:
-        $ python demo_device_control.py --environment PickPlaceCan --robots Sawyer --controller osc
-
-    For two-arm bimanual environment:
-        $ python demo_device_control.py --environment TwoArmLift --robots Baxter --config bimanual --arm left --controller osc
-
-    For two-arm multi single-arm robot environment:
-        $ python demo_device_control.py --environment TwoArmLift --robots Sawyer Sawyer --config single-arm-parallel --controller osc
-
-
-"""
+"""Teleoperate robot with keyboard or SpaceMouse. """
 
 import argparse
 import numpy as np
@@ -107,7 +13,13 @@ import numpy as np
 from datetime import datetime
 import torch
 import csv
-EPISODE_LENGTH = 250 - 1
+import json
+import h5py
+import shutil
+from glob import glob
+
+GOOD_EPISODE_LENGTH = 250 - 1
+MAX_EPISODE_LENGTH = 400 - 1
 SUCCESS_HOLD = 5
 
 class RandomPolicy():
@@ -152,9 +64,43 @@ def write_header(csv_path, header):
 def terminate_condition_met(time_success, timestep_count, term_cond):
     assert term_cond in ["fixed_length", "success_count"]
     if term_cond == "fixed_length":
-        return timestep_count == EPISODE_LENGTH and time_success > 0
+        return timestep_count >= GOOD_EPISODE_LENGTH and time_success > 0
     elif term_cond == "success_count":
         return time_success == SUCCESS_HOLD
+
+def fix_spacemouse_action(action, grasp, last_grasp):
+    """ Fixing Spacemouse Action """
+    # If the current grasp is active (1) and last grasp is not (-1) (i.e.: grasping input just pressed),
+    # toggle arm control and / or camera viewing angle if requested
+    if last_grasp < 0 < grasp:
+        if args.switch_on_grasp:
+            args.arm = "left" if args.arm == "right" else "right"
+        if args.toggle_camera_on_grasp:
+            cam_id = (cam_id + 1) % num_cam
+            env.viewer.set_camera(camera_id=cam_id)
+    # Update last grasp
+    last_grasp = grasp
+
+    # Fill out the rest of the action space if necessary
+    rem_action_dim = env.action_dim - action.size
+    if rem_action_dim > 0:
+        # Initialize remaining action space
+        rem_action = np.zeros(rem_action_dim)
+        # This is a multi-arm setting, choose which arm to control and fill the rest with zeros
+        if args.arm == "right":
+            action = np.concatenate([action, rem_action])
+        elif args.arm == "left":
+            action = np.concatenate([rem_action, action])
+        else:
+            # Only right and left arms supported
+            print("Error: Unsupported arm specified -- "
+                  "must be either 'right' or 'left'! Got: {}".format(args.arm))
+    elif rem_action_dim < 0:
+        # We're in an environment with no gripper action space, so trim the action space to be the action dim
+        action = action[:env.action_dim]
+
+    """ End Fixing Spacemouse Action """
+    return action, last_grasp
 
 def gather_demonstrations_as_hdf5(directory, out_dir, env_info, remove_directory=[]):
     """
@@ -232,7 +178,7 @@ def gather_demonstrations_as_hdf5(directory, out_dir, env_info, remove_directory
         ep_data_grp.create_dataset("actions", data=np.array(actions))
 
     # write dataset attributes (metadata)
-    now = datetime.datetime.now()
+    now = datetime.now()
     grp.attrs["date"] = "{}-{}-{}".format(now.month, now.day, now.year)
     grp.attrs["time"] = "{}:{}:{}".format(now.hour, now.minute, now.second)
     grp.attrs["repository_version"] = suite.__version__
@@ -289,7 +235,13 @@ def collect_trajectory(env, device, args, data, remove_directory):
 
     success_at_time = -1
 
+    grasped = False
+
     while True:
+        if_sleep = False if time_success > 0 else True
+
+        if if_sleep:
+            time.sleep(0.05)
 
         # Set active robot
         active_robot = env.robots[0] if args.config == "bimanual" else env.robots[args.arm == "left"]
@@ -306,37 +258,7 @@ def collect_trajectory(env, device, args, data, remove_directory):
             saving = False
             break
 
-        """ Fixing Spacemouse Action """
-        # If the current grasp is active (1) and last grasp is not (-1) (i.e.: grasping input just pressed),
-        # toggle arm control and / or camera viewing angle if requested
-        if last_grasp < 0 < grasp:
-            if args.switch_on_grasp:
-                args.arm = "left" if args.arm == "right" else "right"
-            if args.toggle_camera_on_grasp:
-                cam_id = (cam_id + 1) % num_cam
-                env.viewer.set_camera(camera_id=cam_id)
-        # Update last grasp
-        last_grasp = grasp
-
-        # Fill out the rest of the action space if necessary
-        rem_action_dim = env.action_dim - action.size
-        if rem_action_dim > 0:
-            # Initialize remaining action space
-            rem_action = np.zeros(rem_action_dim)
-            # This is a multi-arm setting, choose which arm to control and fill the rest with zeros
-            if args.arm == "right":
-                action = np.concatenate([action, rem_action])
-            elif args.arm == "left":
-                action = np.concatenate([rem_action, action])
-            else:
-                # Only right and left arms supported
-                print("Error: Unsupported arm specified -- "
-                      "must be either 'right' or 'left'! Got: {}".format(args.arm))
-        elif rem_action_dim < 0:
-            # We're in an environment with no gripper action space, so trim the action space to be the action dim
-            action = action[:env.action_dim]
-
-        """ End Fixing Spacemouse Action """
+        action, last_grasp = fix_spacemouse_action(action, grasp, last_grasp)
 
         if is_empty_input_spacemouse(action):
             if args.all_demos:
@@ -354,9 +276,27 @@ def collect_trajectory(env, device, args, data, remove_directory):
                 is_human = 0 # iter 0 is viewed as non-intervention
             else:
                 is_human = 1
+        
+        if grasped and action[-1] < -0.7:
+            grasped = False
+            grasp_timesteps = 0
+            while True:
+                grasp_timesteps += 1
+                action_human, grasp = input2action(
+                    device=device,
+                    robot=active_robot,
+                    active_arm=args.arm,
+                    env_configuration=args.config
+                )
+                if grasp_timesteps > 10 or not grasp:
+                    break
+            if grasp:
+                continue
+
+        elif not grasped and action[-1] > 0.7:
+            grasped = True
 
         # Step through the simulation and render
-        print(action)
         next_obs, reward, done, info = env.step(action)
 
         next_obs = post_process_state(next_obs)
@@ -382,9 +322,10 @@ def collect_trajectory(env, device, args, data, remove_directory):
                                    timestep_count=timestep_count,
                                    term_cond=args.term_condition):
             data.append(traj)
+            break
 
         timestep_count += 1
-        if timestep_count > EPISODE_LENGTH:
+        if timestep_count > MAX_EPISODE_LENGTH:
             print("discard this trial")
             saving = False
             break
@@ -397,7 +338,7 @@ def collect_trajectory(env, device, args, data, remove_directory):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--environment", type=str, default="Lift")
+    parser.add_argument("--environment", type=str, default="NutAssembly")
     parser.add_argument("--robots", nargs="+", type=str, default="Panda", help="Which robot(s) to use in the env")
     parser.add_argument("--config", type=str, default="single-arm-opposed",
                         help="Specified environment configuration if necessary")
@@ -405,9 +346,9 @@ if __name__ == "__main__":
     parser.add_argument("--switch-on-grasp", action="store_true", help="Switch gripper control on gripper action")
     parser.add_argument("--toggle-camera-on-grasp", action="store_true", help="Switch camera angle on gripper action")
     parser.add_argument("--controller", type=str, default="osc", help="Choice of controller. Can be 'ik' or 'osc'")
-    parser.add_argument("--device", type=str, default="keyboard")
-    parser.add_argument("--pos-sensitivity", type=float, default=1.0, help="How much to scale position user inputs")
-    parser.add_argument("--rot-sensitivity", type=float, default=1.0, help="How much to scale rotation user inputs")
+    parser.add_argument("--device", type=str, default="spacemouse")
+    parser.add_argument("--pos-sensitivity", type=float, default=1.5, help="How much to scale position user inputs")
+    parser.add_argument("--rot-sensitivity", type=float, default=1.8, help="How much to scale rotation user inputs")
     parser.add_argument("--num-trajectories", type=int, default=20, help="Number of trajectories to collect / evaluate")
     parser.add_argument("--training-iter", type=int)
     parser.add_argument("--checkpoint", type=str, default="")
@@ -431,7 +372,7 @@ if __name__ == "__main__":
 
     # Create argument configuration
     config = {
-        "env_name": args.environment,
+        # "env_name": args.environment,
         "robots": args.robots,
         "controller_configs": controller_config,
     }
@@ -442,12 +383,13 @@ if __name__ == "__main__":
     else:
         args.config = None
 
-    if args.environment == "NutAssembly":
-        config["single_object_mode"] = 2
-        config["nut_type"] = "square"
+    # if args.environment == "NutAssembly":
+    #     config["single_object_mode"] = 2
+    #     config["nut_type"] = "square"
 
     # Create environment
-    env = suite.make(
+    # env = suite.make(
+    env = suite.environments.manipulation.nut_assembly.NutAssemblySquare(
         **config,
         has_renderer=True,
         has_offscreen_renderer=False,
@@ -456,7 +398,7 @@ if __name__ == "__main__":
         use_camera_obs=False,
         reward_shaping=True,
         control_freq=20,
-        hard_reset=False,
+        #hard_reset=False,
     )
 
     save_datetime = datetime.now().strftime("%m_%d_%H_%M_%S")
@@ -514,6 +456,8 @@ if __name__ == "__main__":
 
     for traj_id in tqdm(range(args.num_trajectories)):
         saving, this_human_sample, success_at_time, traj = collect_trajectory(env, device, args, data, remove_directory)
+        print("saving: ", saving)
+        print("success at time: ", success_at_time)
         if saving:
             total_human_samples += this_human_sample
             total_samples += len(traj["actions"])
@@ -536,6 +480,17 @@ if __name__ == "__main__":
     human_sample_per_traj = total_human_samples / len(data)
     aver_time_per_traj = total_time / args.num_trajectories
     aver_traj_length = total_samples / len(data)
+
+    """ Save data into numpy array """
+    save_name = "{}-iter_{}-n_{}_final.npy".format(args.environment,
+                                                   args.training_iter,
+                                                   len(data),
+                                                   )
+
+    save_name_failed = "{}-iter_{}-n_{}_final_failed.npy".format(args.environment,
+                                                                 args.training_iter,
+                                                                 len(data_fail),
+                                                                 )
 
     print("total time: ", total_time)
     print("number of success: ", num_success)
@@ -561,8 +516,8 @@ if __name__ == "__main__":
         human_sample_per_traj,
         aver_time_per_traj,
         aver_traj_length,
-        save_name,
-        args.checkpoint
+        args.checkpoint,
+        os.path.join(save_dir, save_name),
     ]
 
     header = ["Training Round",
@@ -579,23 +534,13 @@ if __name__ == "__main__":
               "Average Trajectory Length",
               "Policy Rollouts Filename",
               "Checkpoint Used",
+              "Save Name"
               ]
 
     from os.path import exists
     if not exists(args.csv_filename):
         write_header(args.csv_filename, header)
     write_to_csv(args.csv_filename, experiment_info)
-
-    """ Save data into numpy array """
-    save_name = "{}-iter_{}-n_{}_final.npy".format(args.environment,
-                                                   args.training_iter,
-                                                   len(data),
-                                                   )
-
-    save_name_failed = "{}-iter_{}-n_{}_final_failed.npy".format(args.environment,
-                                                                 args.training_iter,
-                                                                 len(data_fail),
-                                                                 )
 
     np.save(os.path.join(save_dir, save_name), data)
     np.save(os.path.join(save_dir, save_name_failed), data_fail)
